@@ -1,0 +1,71 @@
+name: Reusable Rust Workspace CI
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "Name of the repository under test (e.g. core, router, spatial)"
+        required: true
+        type: string
+      siblings:
+        description: "Space-separated list of sibling repos to check out alongside this repo"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  check:
+    name: "Rust CI (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Install Linux graphics/window system headers (if spatial/nayuta)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxi-dev libxcursor-dev libxrandr-dev libwayland-dev libxkbcommon-dev libvulkan-dev
+
+      - name: Checkout target repository into sibling layout
+        uses: actions/checkout@v4
+        with:
+          path: ${{ inputs.repo }}
+
+      - name: Checkout required sibling repositories
+        if: inputs.siblings != ''
+        shell: bash
+        run: |
+          for sib in ${{ inputs.siblings }}; do
+            echo "Cloning sibling repository: $sib"
+            git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY_OWNER}/${sib}.git" "${sib}"
+          done
+
+      - name: Configure shared Cargo target directory
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          printf '[build]\ntarget-dir = "target"\n' > .cargo/config.toml
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "${{ inputs.repo }} -> target"
+
+      - name: Check formatting (cargo fmt)
+        working-directory: ${{ inputs.repo }}
+        run: cargo fmt --all -- --check
+
+      - name: Lint with Clippy (cargo clippy)
+        working-directory: ${{ inputs.repo }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run unit & integration tests (cargo test)
+        working-directory: ${{ inputs.repo }}
+        run: cargo test --workspace
