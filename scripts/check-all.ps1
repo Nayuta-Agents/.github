@@ -102,30 +102,46 @@ finally {
 Push-Location (Join-Path $RootDir "nayuta")
 try {
     $headlessTree = cargo tree -p nayuta-headless -e normal
+    if ($LASTEXITCODE -ne 0) { throw "cargo tree failed for GUARD-04 in nayuta" }
     $forbiddenHeadless = $headlessTree | Select-String -Pattern '(^|\s)(wgpu|winit|egui|nayuta-spatial-|nayuta-shader-)'
     if ($forbiddenHeadless) {
         throw "GUARD-04 VIOLATION in nayuta-headless: GPU/window dependency detected:`n$($forbiddenHeadless -join "`n")"
     }
     Write-Host "  [PASS] GUARD-04: nayuta-headless is 100% GPU-free (VPS ready)." -ForegroundColor Green
+}
+finally {
+    Pop-Location
+}
 
-    # GUARD-05: single version of wgpu and winit in nayuta workspace
-    $dupTree = cargo tree -d
-    $dupGraphics = $dupTree | Select-String -Pattern '^(wgpu|winit) v'
-    if ($dupGraphics) {
-        throw "GUARD-05 VIOLATION: duplicate wgpu or winit versions detected:`n$($dupGraphics -join "`n")"
+# GUARD-05: single version of wgpu and winit in spatial and nayuta workspaces
+foreach ($graphicsRepo in @("spatial", "nayuta")) {
+    Push-Location (Join-Path $RootDir $graphicsRepo)
+    try {
+        $dupTree = cargo tree -d
+        if ($LASTEXITCODE -ne 0) { throw "cargo tree -d failed for GUARD-05 in $graphicsRepo" }
+        $dupGraphics = $dupTree | Select-String -Pattern '^(wgpu|winit) v'
+        if ($dupGraphics) {
+            throw "GUARD-05 VIOLATION in ${graphicsRepo}: duplicate wgpu or winit versions detected:`n$($dupGraphics -join "`n")"
+        }
+        Write-Host "  [PASS] GUARD-05 ($graphicsRepo): single unified version of wgpu & winit across workspace." -ForegroundColor Green
     }
-    Write-Host "  [PASS] GUARD-05: single unified version of wgpu & winit across workspace." -ForegroundColor Green
+    finally {
+        Pop-Location
+    }
+}
 
-    if (-not $SkipSmoke) {
+if (-not $SkipSmoke) {
+    Push-Location (Join-Path $RootDir "nayuta")
+    try {
         Write-Host "`n>>> Running Smoke Test: nayuta-headless chat..." -ForegroundColor Yellow
         $smokeOut = cargo run -q -p nayuta-headless -- chat "Halo Nayuta" --provider mock
         if ($LASTEXITCODE -ne 0) { throw "nayuta-headless chat smoke test failed" }
         Write-Host $smokeOut
         Write-Host "  [PASS] Smoke Test: nayuta-headless chat streamed successfully." -ForegroundColor Green
     }
-}
-finally {
-    Pop-Location
+    finally {
+        Pop-Location
+    }
 }
 
 Write-Host "`n============================================================" -ForegroundColor Green

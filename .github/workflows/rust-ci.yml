@@ -32,6 +32,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: ${{ inputs.repo }}
+          lfs: true
 
       - name: Checkout required sibling repositories
         if: inputs.siblings != ''
@@ -69,3 +70,89 @@ jobs:
       - name: Run unit & integration tests (cargo test)
         working-directory: ${{ inputs.repo }}
         run: cargo test --workspace
+
+      - name: Run Architectural Fitness Guards
+        working-directory: ${{ inputs.repo }}
+        shell: bash
+        env:
+          REPO: ${{ inputs.repo }}
+        run: |
+          set -euo pipefail
+
+          check_guard() {
+            local guard_id="$1"
+            local pattern="$2"
+            local pass_msg="$3"
+            local fail_msg="$4"
+            shift 4
+
+            local tree_out
+            tree_out="$("$@")"
+
+            local matches=""
+            local grep_status=0
+            matches="$(printf '%s\n' "$tree_out" | grep -E -- "$pattern")" || grep_status=$?
+
+            if [[ "$grep_status" -eq 0 ]]; then
+              echo "::error::${guard_id} VIOLATION in ${REPO}: ${fail_msg}"
+              printf '%s\n' "$matches" >&2
+              exit 1
+            elif [[ "$grep_status" -gt 1 ]]; then
+              echo "::error::${guard_id}: grep failed with exit status ${grep_status}"
+              exit "$grep_status"
+            fi
+
+            echo "[PASS] ${guard_id}: ${pass_msg}"
+          }
+
+          case "$REPO" in
+            core)
+              check_guard \
+                "GUARD-01" \
+                '(^|[[:space:]])(axum|reqwest|hyper|wgpu|winit|egui)[[:space:]]|tokio v[^[]*\[[^]]*\brt\b' \
+                "nayuta-core-* is free of HTTP/GPU/tokio-rt dependencies." \
+                "forbidden dependency detected" \
+                cargo tree -p nayuta-core-telemetry -e normal -f "{p} [{f}]"
+              ;;
+            vrm)
+              check_guard \
+                "GUARD-02" \
+                '(^|[[:space:]])(wgpu|winit|egui|nayuta-shader-)' \
+                "nayuta-vrm-* is 100% CPU-only." \
+                "GPU/window dependency detected" \
+                cargo tree --workspace -e normal
+              ;;
+            agent)
+              check_guard \
+                "GUARD-03" \
+                '(^|[[:space:]])(nayuta-router-|axum|wgpu|winit)' \
+                "nayuta-agent-* is decoupled from nayuta-router-*." \
+                "direct router/GPU dependency detected" \
+                cargo tree --workspace -e normal
+              ;;
+            spatial)
+              check_guard \
+                "GUARD-05" \
+                '^(wgpu|winit) v' \
+                "single unified version of wgpu & winit in spatial." \
+                "duplicate wgpu or winit versions detected" \
+                cargo tree -d
+              ;;
+            nayuta)
+              check_guard \
+                "GUARD-04" \
+                '(^|[[:space:]])(wgpu|winit|egui|nayuta-spatial-|nayuta-shader-)' \
+                "nayuta-headless is 100% GPU-free (VPS ready)." \
+                "GPU/window dependency detected" \
+                cargo tree -p nayuta-headless -e normal
+              check_guard \
+                "GUARD-05" \
+                '^(wgpu|winit) v' \
+                "single unified version of wgpu & winit in nayuta." \
+                "duplicate wgpu or winit versions detected" \
+                cargo tree -d
+              ;;
+            *)
+              echo "No architectural fitness guards configured for repo '$REPO'."
+              ;;
+          esac
