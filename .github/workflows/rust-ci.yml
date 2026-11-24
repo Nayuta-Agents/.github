@@ -4,14 +4,27 @@ on:
   workflow_call:
     inputs:
       repo:
-        description: "Name of the repository under test (e.g. core, router, spatial)"
+        description: "Name of the Rust repository under test"
         required: true
         type: string
       siblings:
-        description: "Space-separated list of sibling repos to check out alongside this repo"
+        description: "Space-separated sibling repositories required by this workspace"
         required: false
         default: ""
         type: string
+      integration-ref:
+        description: "Explicit branch shared by sibling repositories and CI helpers"
+        required: false
+        default: "dev"
+        type: string
+      test-assets:
+        description: "Run ignored integration tests with checked-out LFS assets"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 jobs:
   check:
@@ -22,8 +35,29 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - name: Install Linux graphics/window system headers (if spatial/nayuta)
-        if: runner.os == 'Linux'
+      - name: Validate sibling layout inputs
+        shell: bash
+        env:
+          REPO: ${{ inputs.repo }}
+          SIBLINGS: ${{ inputs.siblings }}
+          INTEGRATION_REF: ${{ inputs.integration-ref }}
+        run: |
+          set -euo pipefail
+          case "$REPO" in
+            core|shaders|vrm|router|agent|sdk|spatial|nayuta) ;;
+            *) printf 'Invalid Rust repository: %s\n' "$REPO" >&2; exit 2 ;;
+          esac
+          read -r -a siblings <<< "$SIBLINGS"
+          for sib in "${siblings[@]}"; do
+            case "$sib" in
+              core|shaders|vrm|router|agent|sdk|spatial|nayuta|assets) ;;
+              *) printf 'Invalid sibling repository: %s\n' "$sib" >&2; exit 2 ;;
+            esac
+          done
+          git check-ref-format --branch "$INTEGRATION_REF" >/dev/null
+
+      - name: Install Linux graphics and window headers
+        if: runner.os == 'Linux' && (inputs.repo == 'spatial' || inputs.repo == 'nayuta')
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libx11-dev libxi-dev libxcursor-dev libxrandr-dev libwayland-dev libxkbcommon-dev libvulkan-dev
@@ -34,13 +68,29 @@ jobs:
           path: ${{ inputs.repo }}
           lfs: true
 
+      - name: Checkout shared verification helpers
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          ref: ${{ inputs.integration-ref }}
+          path: .github
+
       - name: Checkout required sibling repositories
         if: inputs.siblings != ''
         shell: bash
+        env:
+          SIBLINGS: ${{ inputs.siblings }}
+          INTEGRATION_REF: ${{ inputs.integration-ref }}
         run: |
-          for sib in ${{ inputs.siblings }}; do
-            echo "Cloning sibling repository: $sib"
-            git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY_OWNER}/${sib}.git" "${sib}"
+          set -euo pipefail
+          read -r -a siblings <<< "$SIBLINGS"
+          for sib in "${siblings[@]}"; do
+            printf 'Cloning sibling repository: %s (%s)\n' "$sib" "$INTEGRATION_REF"
+            git clone --depth 1 --branch "$INTEGRATION_REF" "https://github.com/${GITHUB_REPOSITORY_OWNER}/${sib}.git" "$sib"
+            if [[ -f "$sib/.gitattributes" ]]; then
+              git -C "$sib" lfs install --local
+              git -C "$sib" lfs pull
+            fi
           done
 
       - name: Configure shared Cargo target directory
@@ -59,100 +109,56 @@ jobs:
         with:
           workspaces: "${{ inputs.repo }} -> target"
 
-      - name: Check formatting (cargo fmt)
-        working-directory: ${{ inputs.repo }}
-        run: cargo fmt --all -- --check
+      - name: Test Bash verification fixtures
+        shell: bash
+        run: bash .github/scripts/test-verification.sh
 
-      - name: Lint with Clippy (cargo clippy)
-        working-directory: ${{ inputs.repo }}
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test PowerShell verification fixtures
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& ./.github/scripts/test-verification.ps1'
 
-      - name: Run unit & integration tests (cargo test)
+      - name: Check formatting
         working-directory: ${{ inputs.repo }}
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          source ../.github/scripts/verification.sh
+          checked_cargo fmt --all -- --check
 
-      - name: Run Architectural Fitness Guards
+      - name: Lint with Clippy and reject Cargo warnings
+        working-directory: ${{ inputs.repo }}
+        shell: bash
+        run: |
+          source ../.github/scripts/verification.sh
+          checked_cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run unit and integration tests
+        working-directory: ${{ inputs.repo }}
+        shell: bash
+        run: |
+          source ../.github/scripts/verification.sh
+          checked_cargo test --workspace
+
+      - name: Run architectural fitness guards
+        shell: bash
+        env:
+          REPO: ${{ inputs.repo }}
+        run: |
+          source .github/scripts/verification.sh
+          run_architectural_guards "$REPO" "$GITHUB_WORKSPACE"
+
+      - name: Run LFS asset integration tests
+        if: inputs.test-assets
         working-directory: ${{ inputs.repo }}
         shell: bash
         env:
           REPO: ${{ inputs.repo }}
         run: |
           set -euo pipefail
-
-          check_guard() {
-            local guard_id="$1"
-            local pattern="$2"
-            local pass_msg="$3"
-            local fail_msg="$4"
-            shift 4
-
-            local tree_out
-            tree_out="$("$@")"
-
-            local matches=""
-            local grep_status=0
-            matches="$(printf '%s\n' "$tree_out" | grep -E -- "$pattern")" || grep_status=$?
-
-            if [[ "$grep_status" -eq 0 ]]; then
-              echo "::error::${guard_id} VIOLATION in ${REPO}: ${fail_msg}"
-              printf '%s\n' "$matches" >&2
-              exit 1
-            elif [[ "$grep_status" -gt 1 ]]; then
-              echo "::error::${guard_id}: grep failed with exit status ${grep_status}"
-              exit "$grep_status"
-            fi
-
-            echo "[PASS] ${guard_id}: ${pass_msg}"
-          }
-
+          source ../.github/scripts/verification.sh
+          git -C ../assets lfs fsck
           case "$REPO" in
-            core)
-              check_guard \
-                "GUARD-01" \
-                '(^|[[:space:]])(axum|reqwest|hyper|wgpu|winit|egui)[[:space:]]|tokio v[^[]*\[[^]]*\brt\b' \
-                "nayuta-core-* is free of HTTP/GPU/tokio-rt dependencies." \
-                "forbidden dependency detected" \
-                cargo tree -p nayuta-core-telemetry -e normal -f "{p} [{f}]"
-              ;;
-            vrm)
-              check_guard \
-                "GUARD-02" \
-                '(^|[[:space:]])(wgpu|winit|egui|nayuta-shader-)' \
-                "nayuta-vrm-* is 100% CPU-only." \
-                "GPU/window dependency detected" \
-                cargo tree --workspace -e normal
-              ;;
-            agent)
-              check_guard \
-                "GUARD-03" \
-                '(^|[[:space:]])(nayuta-router-|axum|wgpu|winit)' \
-                "nayuta-agent-* is decoupled from nayuta-router-*." \
-                "direct router/GPU dependency detected" \
-                cargo tree --workspace -e normal
-              ;;
-            spatial)
-              check_guard \
-                "GUARD-05" \
-                '^(wgpu|winit) v' \
-                "single unified version of wgpu & winit in spatial." \
-                "duplicate wgpu or winit versions detected" \
-                cargo tree -d
-              ;;
-            nayuta)
-              check_guard \
-                "GUARD-04" \
-                '(^|[[:space:]])(wgpu|winit|egui|nayuta-spatial-|nayuta-shader-)' \
-                "nayuta-headless is 100% GPU-free (VPS ready)." \
-                "GPU/window dependency detected" \
-                cargo tree -p nayuta-headless -e normal
-              check_guard \
-                "GUARD-05" \
-                '^(wgpu|winit) v' \
-                "single unified version of wgpu & winit in nayuta." \
-                "duplicate wgpu or winit versions detected" \
-                cargo tree -d
-              ;;
-            *)
-              echo "No architectural fitness guards configured for repo '$REPO'."
-              ;;
+            vrm) checked_cargo test -p nayuta-vrm-animation -- --ignored ;;
+            nayuta) checked_cargo test -p nayuta-desktop -- --ignored ;;
+            *) printf 'Asset tests are not configured for %s\n' "$REPO" >&2; exit 2 ;;
           esac
