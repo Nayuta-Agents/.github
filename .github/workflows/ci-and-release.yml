@@ -1,0 +1,201 @@
+name: Nayuta CI and Release Staging
+
+on:
+  push:
+    branches: [main, dev]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      integration-ref:
+        description: "Shared branch for sibling repositories and .github helpers"
+        required: false
+        default: "dev"
+        type: string
+      stage-release:
+        description: "Build and stage release artifacts (never pushes or publishes automatically)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  INTEGRATION_REF: ${{ github.event.inputs.integration-ref || 'dev' }}
+
+jobs:
+  ci-matrix:
+    name: "CI (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Install Linux graphics and window headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxi-dev libxcursor-dev libxrandr-dev libwayland-dev libxkbcommon-dev libvulkan-dev
+
+      - name: Checkout nayuta repository
+        uses: actions/checkout@v4
+        with:
+          path: nayuta
+          lfs: true
+
+      - name: Checkout shared .github scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          ref: ${{ env.INTEGRATION_REF }}
+          path: .github
+
+      - name: Checkout sibling repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sib in core shaders vrm router agent sdk spatial assets; do
+            printf 'Cloning sibling repository: %s (%s)\n' "$sib" "$INTEGRATION_REF"
+            git clone --depth 1 --branch "$INTEGRATION_REF" "https://github.com/${GITHUB_REPOSITORY_OWNER}/${sib}.git" "$sib"
+            if [[ -f "$sib/.gitattributes" ]]; then
+              git -C "$sib" lfs install --local
+              git -C "$sib" lfs pull
+            fi
+          done
+
+      - name: Configure shared Cargo target directory
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          printf '[build]\ntarget-dir = "target"\n' > .cargo/config.toml
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "nayuta -> target"
+
+      - name: Run formatting, clippy, tests, and GUARD-01..05 (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/verification.sh
+          for repo in core shaders vrm router agent sdk spatial nayuta; do
+            (
+              cd "$repo"
+              checked_cargo fmt --all -- --check
+              checked_cargo clippy --workspace --all-targets -- -D warnings
+              checked_cargo test --workspace
+            )
+            run_architectural_guards "$repo" "$GITHUB_WORKSPACE"
+          done
+
+      - name: Run formatting, clippy, tests, and GUARD-01..05 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./.github/scripts/check-all.ps1 -SkipSmoke
+
+  stage-release:
+    name: "Stage Release (${{ matrix.os }})"
+    needs: ci-matrix
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.stage-release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Install Linux graphics and window headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxi-dev libxcursor-dev libxrandr-dev libwayland-dev libxkbcommon-dev libvulkan-dev
+
+      - name: Checkout nayuta repository
+        uses: actions/checkout@v4
+        with:
+          path: nayuta
+          lfs: true
+
+      - name: Checkout shared .github scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          ref: ${{ env.INTEGRATION_REF }}
+          path: .github
+
+      - name: Checkout sibling repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sib in core shaders vrm router agent sdk spatial assets; do
+            git clone --depth 1 --branch "$INTEGRATION_REF" "https://github.com/${GITHUB_REPOSITORY_OWNER}/${sib}.git" "$sib"
+            if [[ -f "$sib/.gitattributes" ]]; then
+              git -C "$sib" lfs install --local
+              git -C "$sib" lfs pull
+            fi
+          done
+
+      - name: Configure shared Cargo target directory
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          printf '[build]\ntarget-dir = "target"\n' > .cargo/config.toml
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "nayuta -> target"
+
+      - name: Build and stage Linux release artifacts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME:-0.1.0}"
+          VERSION="${VERSION#v}"
+          cargo build --manifest-path nayuta/Cargo.toml --release -p nayuta-headless -p nayuta-desktop
+          mkdir -p dist/release-linux
+          cp target/release/nayuta-headless dist/release-linux/
+          tar -C dist/release-linux -czf "dist/release-linux/nayuta-headless-${VERSION}-linux-x86_64.tar.gz" nayuta-headless
+          bash nayuta/packaging/linux-appimage.sh \
+            --target-dir target/release \
+            --out-dir dist/release-linux \
+            --version "$VERSION" \
+            --skip-build
+          (cd dist/release-linux && sha256sum *.tar.gz *.AppImage 2>/dev/null > SHA256SUMS.txt || sha256sum *.tar.gz > SHA256SUMS.txt)
+
+      - name: Build and stage Windows release artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.1.0' }
+          cargo build --manifest-path nayuta/Cargo.toml --release -p nayuta-headless -p nayuta-desktop
+          & ./nayuta/packaging/windows-installer.ps1 `
+            -TargetDir "target/release" `
+            -OutDir "dist/release-windows" `
+            -Version $version `
+            -IncludeHeadless `
+            -SkipBuild
+
+      - name: Upload staged release artifacts (manual offline signing required)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nayuta-staged-${{ matrix.os }}
+          path: dist/release-*/*
+          retention-days: 14
